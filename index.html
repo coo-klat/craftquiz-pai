@@ -986,14 +986,17 @@
         // 2. GAME STATE & MULTIPLAYER CONFIGURATION
         // ============================================================================
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-pai9-craftquiz';
-        const ONLINE_TIMEOUT_MS = 35000;
+        const ONLINE_TIMEOUT_MS = 60000;
         let db = null;
         let auth = null;
         let currentUser = null;
         let fbModules = null;
 
+        // Gunakan Session ID unik per tab/perangkat agar tidak pernah bentrok meskipun di browser yang sama
+        const UNIQUE_SESSION_ID = 'p-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 8);
+
         const playerState = {
-            id: 'p-' + Math.random().toString(36).substring(2, 10),
+            id: UNIQUE_SESSION_ID,
             name: "Siswa",
             className: "9A",
             room: "PAI9-UHKIAMAT",
@@ -1441,14 +1444,38 @@
                 } else if (msg.type === 'PLAYER_SYNC' && msg.payload && msg.payload.id !== playerState.id) {
                     upsertRemotePlayer(msg.payload.id, msg.payload);
                     updateOnlineCounterAndLeaderboard();
+                } else if (msg.type === 'PLAYER_JOIN_REQUEST' && msg.senderId !== playerState.id) {
+                    // Saat ada siswa baru masuk, siswa yang sudah masuk lebih dulu langsung mengirim posisinya kembali
+                    if (playerState.joined) {
+                        syncLocalPlayerToCloud(true, true);
+                    }
+                } else if (msg.type === 'PLAYER_LEAVE' && msg.senderId) {
+                    removeRemotePlayer(msg.senderId);
+                    updateOnlineCounterAndLeaderboard();
                 } else if (msg.type === 'PLAYER_ACTION' && msg.payload && msg.payload.senderId !== playerState.id) {
                     handleIncomingPlayerAction(msg.payload);
                 }
             };
         }
 
+        function removeRemotePlayer(pid) {
+            const remote = otherPlayers.get(pid);
+            if (!remote) return;
+            if (remote.mesh && scene) scene.remove(remote.mesh);
+            if (remote.labelEl) remote.labelEl.remove();
+            otherPlayers.delete(pid);
+        }
+
         function upsertRemotePlayer(pid, data) {
+            if (!pid || pid === playerState.id) return;
+            if (data && data.online === false) {
+                removeRemotePlayer(pid);
+                return;
+            }
+
             let remote = otherPlayers.get(pid);
+            const nowLocal = Date.now();
+
             if (!remote) {
                 const mesh = webglAvailable ? createBlockyAvatar(data.color || '#3b82f6') : null;
                 if (mesh && scene) {
@@ -1465,6 +1492,8 @@
                     data,
                     mesh,
                     labelEl,
+                    localSeenAt: nowLocal,
+                    lastCloudUpdatedAt: data.updatedAt || nowLocal,
                     targetPos: { x: data.x || 0, y: data.y || 0, z: data.z || 0 },
                     targetRot: data.rotY || 0,
                     knockbackVX: 0,
@@ -1476,7 +1505,22 @@
                     chatBubbleUntil: 0
                 };
                 otherPlayers.set(pid, remote);
+
+                // Tampilkan notifikasi kecil di feed saat siswa baru bergabung ke pulau
+                if (playerState.joined && data.name) {
+                    addInteractionFeedItem('🟢', `${data.name} (${data.className || 'Siswa'}) bergabung ke pulau!`, 'border-emerald-400');
+                }
             } else {
+                // Jika data dari cloud berubah (atau koordinat berubah), perbarui waktu aktif lokal penerima
+                if (
+                    data.updatedAt !== remote.lastCloudUpdatedAt ||
+                    data.x !== remote.targetPos.x ||
+                    data.z !== remote.targetPos.z ||
+                    data.score !== (remote.data && remote.data.score)
+                ) {
+                    remote.localSeenAt = nowLocal;
+                    remote.lastCloudUpdatedAt = data.updatedAt || nowLocal;
+                }
                 remote.data = data;
                 remote.targetPos.x = data.x || 0;
                 remote.targetPos.y = data.y || 0;
@@ -1962,7 +2006,7 @@
 
         function updateOnlineCounterAndLeaderboard() {
             const allPlayers = [];
-            const now = Date.now();
+            const nowLocal = Date.now();
             if (playerState.joined) {
                 allPlayers.push({
                     id: playerState.id,
@@ -1976,11 +2020,9 @@
                 });
             }
             for (const [pid, remote] of otherPlayers.entries()) {
-                // Bersihkan siswa yang sudah keluar / tidak aktif lebih dari batas waktu
-                if (!remote.isBot && remote.data && remote.data.updatedAt && (now - remote.data.updatedAt > ONLINE_TIMEOUT_MS)) {
-                    if (remote.mesh && scene) scene.remove(remote.mesh);
-                    if (remote.labelEl) remote.labelEl.remove();
-                    otherPlayers.delete(pid);
+                // Gunakan localSeenAt (waktu perangkat penerima) agar perbedaan jam HP antar-siswa tidak menghapus pemain baru
+                if (!remote.isBot && remote.localSeenAt && (nowLocal - remote.localSeenAt > ONLINE_TIMEOUT_MS)) {
+                    removeRemotePlayer(pid);
                     continue;
                 }
                 if (remote.data && remote.data.online !== false) {
@@ -2165,7 +2207,7 @@
 
                 if (cred && cred.user) {
                     currentUser = cred.user;
-                    playerState.id = currentUser.uid;
+                    // Tetap gunakan UNIQUE_SESSION_ID agar beberapa tab/perangkat tidak pernah saling menimpa dokumen
                 }
 
                 if (statusEl) {
@@ -2179,7 +2221,7 @@
 
                 if (playerState.joined) {
                     startMultiplayerRoomListener();
-                    syncLocalPlayerToCloud(true);
+                    await syncLocalPlayerToCloud(true, true);
                 }
             } catch (err) {
                 console.warn("Berjalan dalam Mode Lokal/Instan:", err);
@@ -2385,29 +2427,42 @@
             const playersCol = fbModules.collection(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_players');
             unsubscribeRoom = fbModules.onSnapshot(playersCol, (snapshot) => {
                 const activeIds = new Set();
-                const nowMs = Date.now();
 
+                // Deteksi perubahan dokumen secara real-time (added / modified / removed)
+                snapshot.docChanges().forEach((change) => {
+                    const docId = change.doc.id;
+                    const data = change.doc.data();
+                    if (!data || data.room !== playerState.room || docId === playerState.id) return;
+
+                    if (change.type === 'removed' || data.online === false) {
+                        removeRemotePlayer(docId);
+                    } else if (change.type === 'added' || change.type === 'modified') {
+                        upsertRemotePlayer(docId, data);
+                    }
+                });
+
+                // Pastikan seluruh dokumen aktif di room yang sama tercatat
                 snapshot.forEach((docSnap) => {
                     const data = docSnap.data();
                     if (!data || data.room !== playerState.room) return;
-                    // Hanya tampilkan siswa yang benar-benar aktif dalam 45 detik terakhir
-                    if (data.updatedAt && (nowMs - data.updatedAt > 45000)) return;
+                    if (data.online === false) return;
                     activeIds.add(docSnap.id);
 
-                    if (docSnap.id === playerState.id) return;
-                    upsertRemotePlayer(docSnap.id, data);
+                    if (docSnap.id !== playerState.id) {
+                        upsertRemotePlayer(docSnap.id, data);
+                    }
                 });
 
                 for (const [pid, remote] of otherPlayers.entries()) {
                     if (!activeIds.has(pid) && !remote.isBot) {
-                        if (remote.mesh && scene) scene.remove(remote.mesh);
-                        if (remote.labelEl) remote.labelEl.remove();
-                        otherPlayers.delete(pid);
+                        removeRemotePlayer(pid);
                     }
                 }
 
                 updateOnlineCounterAndLeaderboard();
-            }, () => {});
+            }, (err) => {
+                console.warn("Realtime listener error:", err);
+            });
         }
 
         async function syncLocalPlayerToCloud(force = false, isOnline = true) {
@@ -2447,18 +2502,20 @@
             } catch (e) {}
         }
 
-        // Heartbeat otomatis setiap 12 detik agar pemain yang diam tetap tercatat Online,
-        // sekaligus membersihkan pemain yang sudah menutup browser/keluar.
+        // Heartbeat otomatis setiap 8 detik agar pemain yang diam tetap tercatat Online
         setInterval(() => {
             if (playerState.joined) {
                 syncLocalPlayerToCloud(true, true);
                 updateOnlineCounterAndLeaderboard();
             }
-        }, 12000);
+        }, 8000);
 
         // Tandai offline saat siswa menutup tab/browser
         window.addEventListener('beforeunload', () => {
             if (playerState.joined) {
+                if (localChannel) {
+                    try { localChannel.postMessage({ type: 'PLAYER_LEAVE', room: playerState.room, senderId: playerState.id }); } catch (e) {}
+                }
                 syncLocalPlayerToCloud(true, false);
             }
         });
@@ -2652,7 +2709,26 @@
             fetchRoomConfigOnce(playerState.room);
             updateOnlineCounterAndLeaderboard();
             startMultiplayerRoomListener();
-            syncLocalPlayerToCloud(true);
+            syncLocalPlayerToCloud(true, true);
+
+            // Kirim sinyal kedatangan ke tab/perangkat lain dan ulangi sinkronisasi setelah 1 detik & 2.5 detik
+            // untuk memastikan koneksi Firebase yang baru selesai login langsung menyebarkan posisi siswa baru
+            if (localChannel) {
+                try {
+                    localChannel.postMessage({ type: 'PLAYER_JOIN_REQUEST', room: playerState.room, senderId: playerState.id });
+                } catch (e) {}
+            }
+            setTimeout(() => {
+                if (playerState.joined) {
+                    startMultiplayerRoomListener();
+                    syncLocalPlayerToCloud(true, true);
+                }
+            }, 1000);
+            setTimeout(() => {
+                if (playerState.joined) {
+                    syncLocalPlayerToCloud(true, true);
+                }
+            }, 2500);
         }
         window.startCraftQuiz = startCraftQuiz;
 
@@ -2719,6 +2795,9 @@
         });
 
         function returnToLobby() {
+            if (localChannel) {
+                try { localChannel.postMessage({ type: 'PLAYER_LEAVE', room: playerState.room, senderId: playerState.id }); } catch (e) {}
+            }
             // Hapus dokumen kehadiran saat keluar dari room agar langsung hilang dari layar siswa lain
             if (db && currentUser && fbModules && playerState.id) {
                 try {
@@ -2736,23 +2815,6 @@
             localNameLabel.classList.add('hidden');
         }
         window.returnToLobby = returnToLobby;
-
-        // Heartbeat otomatis setiap 8 detik agar karakter siswa yang online tetap terdaftar aktif
-        setInterval(() => {
-            if (playerState.joined) {
-                syncLocalPlayerToCloud(true);
-            }
-        }, 8000);
-
-        // Hapus kehadiran pemain ketika tab browser ditutup
-        window.addEventListener('beforeunload', () => {
-            if (db && currentUser && fbModules && playerState.id && playerState.joined) {
-                try {
-                    const playerRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_players', playerState.id);
-                    fbModules.deleteDoc(playerRef);
-                } catch (e) {}
-            }
-        });
 
         // ============================================================================
         // PANEL PENGATURAN GURU (BUAT ROOM BARU, KELAS, SEMBUNYIKAN TELEPORT & SOAL)
