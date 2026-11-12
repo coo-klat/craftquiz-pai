@@ -968,8 +968,9 @@
                     topic: 'Iman Kepada Hari Akhir',
                     classes: ["9A", "9B", "9C", "9D", "9E"],
                     allowTeleport: true,
+                    allowPvp: true,
                     questionsJson: JSON.stringify(DEFAULT_QUESTIONS),
-                    updatedAt: Date.now()
+                    updatedAt: 0
                 };
             }
         }
@@ -1438,10 +1439,21 @@
         if (localChannel) {
             localChannel.onmessage = (ev) => {
                 const msg = ev.data;
-                if (!msg || msg.room !== playerState.room) return;
-                if (msg.type === 'ROOM_CONFIG') {
-                    applyRoomConfigData(msg.payload);
-                } else if (msg.type === 'PLAYER_SYNC' && msg.payload && msg.payload.id !== playerState.id) {
+                if (!msg) return;
+                // Simpan semua Room baru yang diumumkan walaupun siswa sedang melihat room lain di Lobby
+                if (msg.type === 'ROOM_CONFIG' && msg.payload && msg.payload.room) {
+                    memoryRoomConfigs[msg.payload.room] = msg.payload;
+                    saveStoredRoomsToLocal();
+                    renderSavedRoomsListUI();
+                    const lobbyInput = document.getElementById('input-room');
+                    const activeLobbyRoom = lobbyInput ? lobbyInput.value.trim().toUpperCase() : '';
+                    if (msg.room === playerState.room || (!playerState.joined && msg.room === activeLobbyRoom)) {
+                        applyRoomConfigData(msg.payload);
+                    }
+                    return;
+                }
+                if (msg.room !== playerState.room) return;
+                if (msg.type === 'PLAYER_SYNC' && msg.payload && msg.payload.id !== playerState.id) {
                     upsertRemotePlayer(msg.payload.id, msg.payload);
                     updateOnlineCounterAndLeaderboard();
                 } else if (msg.type === 'PLAYER_JOIN_REQUEST' && msg.senderId !== playerState.id) {
@@ -2140,17 +2152,99 @@
         async function fetchRoomConfigOnce(roomCode) {
             const clean = (roomCode || '').trim().toUpperCase();
             if (!clean) return;
+            // Utamakan mengambil data terbaru dari Cloud Firestore terlebih dahulu agar perangkat lain mendapat update terbaru
+            if (db && fbModules) {
+                try {
+                    const cfgRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms', clean);
+                    const snap = await fbModules.getDoc(cfgRef);
+                    if (snap.exists()) {
+                        const cloudData = snap.data();
+                        memoryRoomConfigs[clean] = cloudData;
+                        saveStoredRoomsToLocal();
+                        applyRoomConfigData(cloudData);
+                        return;
+                    }
+                } catch (e) {}
+            }
             if (memoryRoomConfigs[clean]) {
                 applyRoomConfigData(memoryRoomConfigs[clean]);
             }
-            if (!db || !fbModules) return;
+        }
+
+        let unsubscribeAllRoomsList = null;
+
+        function startGlobalRoomsListListener() {
+            if (!db || !currentUser || !fbModules) return;
+            if (unsubscribeAllRoomsList) unsubscribeAllRoomsList();
+
             try {
-                const cfgRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms', clean);
-                const snap = await fbModules.getDoc(cfgRef);
-                if (snap.exists()) {
-                    applyRoomConfigData(snap.data());
-                }
+                const roomsCol = fbModules.collection(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms');
+                unsubscribeAllRoomsList = fbModules.onSnapshot(roomsCol, (snapshot) => {
+                    const lobbyInput = document.getElementById('input-room');
+                    const currentLobbyRoom = lobbyInput ? lobbyInput.value.trim().toUpperCase() : '';
+
+                    snapshot.forEach((docSnap) => {
+                        const data = docSnap.data();
+                        const roomCode = (data && data.room) ? data.room.toUpperCase() : docSnap.id.toUpperCase();
+                        if (!data || !roomCode) return;
+                        data.room = roomCode;
+
+                        const existing = memoryRoomConfigs[roomCode];
+                        // Selalu perbarui daftar room lokal dengan data dari Cloud
+                        if (!existing || (data.updatedAt || 0) >= (existing.updatedAt || 0)) {
+                            memoryRoomConfigs[roomCode] = data;
+                        }
+
+                        // Jika room yang diupdate di Cloud adalah room yang sedang dipilih di Lobby atau sedang dimainkan
+                        if (
+                            (playerState.joined && roomCode === playerState.room) ||
+                            (!playerState.joined && roomCode === currentLobbyRoom)
+                        ) {
+                            applyRoomConfigData(data);
+                        }
+                    });
+
+                    saveStoredRoomsToLocal();
+                    renderSavedRoomsListUI();
+                }, (err) => {
+                    console.warn("Global rooms listener error:", err);
+                });
             } catch (e) {}
+        }
+
+        async function saveRoomConfigToCloud(configPayload) {
+            if (!configPayload || !configPayload.room) return false;
+            const roomCode = configPayload.room.trim().toUpperCase();
+            configPayload.room = roomCode;
+
+            memoryRoomConfigs[roomCode] = configPayload;
+            saveStoredRoomsToLocal();
+            renderSavedRoomsListUI();
+
+            if (localChannel) {
+                try {
+                    localChannel.postMessage({ type: 'ROOM_CONFIG', room: roomCode, payload: configPayload });
+                } catch (e) {}
+            }
+
+            if (!db || !fbModules) {
+                await initFirebaseMultiplayer();
+            }
+            if (db && fbModules) {
+                try {
+                    if (!currentUser && auth) {
+                        const cred = await fbModules.signInAnonymously(auth);
+                        if (cred && cred.user) currentUser = cred.user;
+                    }
+                    const cfgRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms', roomCode);
+                    await fbModules.setDoc(cfgRef, configPayload);
+                    return true;
+                } catch (err) {
+                    console.warn("Gagal menyimpan room ke Cloud Firestore:", err);
+                    return false;
+                }
+            }
+            return false;
         }
 
         function resolveFirebaseConfigObject() {
@@ -2218,6 +2312,9 @@
                 const initialRoomEl = document.getElementById('input-room');
                 const initialRoom = initialRoomEl ? initialRoomEl.value.trim().toUpperCase() : 'PAI9-UHKIAMAT';
                 if (initialRoom) fetchRoomConfigOnce(initialRoom);
+
+                // Dengarkan seluruh daftar Room yang dibuat Guru secara real-time di semua perangkat
+                startGlobalRoomsListListener();
 
                 if (playerState.joined) {
                     startMultiplayerRoomListener();
@@ -2882,19 +2979,7 @@
             };
 
             applyRoomConfigData(configPayload);
-
-            if (localChannel) {
-                try { localChannel.postMessage({ type: 'ROOM_CONFIG', room: playerState.room, payload: configPayload }); } catch (e) {}
-            }
-            if (db && currentUser && fbModules) {
-                try {
-                    const cfgRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms', playerState.room);
-                    await Promise.race([
-                        fbModules.setDoc(cfgRef, configPayload),
-                        new Promise(r => setTimeout(r, 800))
-                    ]);
-                } catch (e) {}
-            }
+            await saveRoomConfigToCloud(configPayload);
 
             showToast(roomSettings.allowTeleport
                 ? `Tombol Teleport Soal kini DITAMPILKAN untuk siswa di Room [${playerState.room}].`
@@ -2918,19 +3003,7 @@
             };
 
             applyRoomConfigData(configPayload);
-
-            if (localChannel) {
-                try { localChannel.postMessage({ type: 'ROOM_CONFIG', room: playerState.room, payload: configPayload }); } catch (e) {}
-            }
-            if (db && currentUser && fbModules) {
-                try {
-                    const cfgRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms', playerState.room);
-                    await Promise.race([
-                        fbModules.setDoc(cfgRef, configPayload),
-                        new Promise(r => setTimeout(r, 800))
-                    ]);
-                } catch (e) {}
-            }
+            await saveRoomConfigToCloud(configPayload);
 
             showToast(roomSettings.allowPvp
                 ? `Fitur Pukul & Lempar Bola Salju kini DIAKTIFKAN di Room [${playerState.room}].`
@@ -2949,7 +3022,7 @@
         });
 
         // Tombol "Buat Room Baru" di dalam Panel Guru
-        document.getElementById('btn-ts-create-blank-room').addEventListener('click', () => {
+        document.getElementById('btn-ts-create-blank-room').addEventListener('click', async () => {
             let newCode = document.getElementById('ts-input-room-code').value.trim().toUpperCase().replace(/\s+/g, '-');
             if (!newCode || newCode === playerState.room) {
                 newCode = 'ROOM-' + Math.floor(100 + Math.random() * 900);
@@ -2987,7 +3060,22 @@
             });
 
             renderTeacherQuestionsEditor();
-            showToast(`Room Baru [${newCode}] dibuat! Silakan sesuaikan soal lalu klik SIMPAN.`);
+
+            // Langsung daftarkan Room baru ke Cloud agar seketika muncul di perangkat lain
+            const initialPayload = {
+                room: newCode,
+                topic: newTopic,
+                classes: roomSettings.classes,
+                allowTeleport: roomSettings.allowTeleport,
+                allowPvp: roomSettings.allowPvp,
+                questionsJson: JSON.stringify(editorDraftQuestions),
+                updatedAt: Date.now()
+            };
+            applyRoomConfigData(initialPayload);
+            startMultiplayerRoomListener();
+            await saveRoomConfigToCloud(initialPayload);
+
+            showToast(`Room Baru [${newCode}] berhasil dibuat & disinkronkan ke Cloud! Silakan edit soal lalu klik SIMPAN.`);
         });
 
         function syncDraftFromDOM() {
@@ -3188,22 +3276,25 @@
             applyRoomConfigData(configPayload);
             startMultiplayerRoomListener();
 
-            if (localChannel) {
-                try { localChannel.postMessage({ type: 'ROOM_CONFIG', room: playerState.room, payload: configPayload }); } catch (e) {}
+            const saveBtn = document.getElementById('btn-ts-save');
+            const origText = saveBtn ? saveBtn.innerHTML : '';
+            if (saveBtn) {
+                saveBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> MENYIMPAN KE CLOUD...`;
+                saveBtn.disabled = true;
             }
 
-            if (db && currentUser && fbModules) {
-                try {
-                    const cfgRef = fbModules.doc(db, 'artifacts', appId, 'public', 'data', 'pai9_hariakhir_rooms', playerState.room);
-                    await Promise.race([
-                        fbModules.setDoc(cfgRef, configPayload),
-                        new Promise((resolve) => setTimeout(resolve, 1000))
-                    ]);
-                } catch (e) {}
+            const savedOnline = await saveRoomConfigToCloud(configPayload);
+
+            if (saveBtn) {
+                saveBtn.innerHTML = origText;
+                saveBtn.disabled = false;
             }
 
             document.getElementById('teacher-settings-modal').classList.add('hidden');
-            showToast(`Room [${playerState.room}] (${roomSettings.topic} - ${QUESTIONS.length} Soal) berhasil disimpan!`);
+            showToast(savedOnline
+                ? `✅ Room [${playerState.room}] (${roomSettings.topic} - ${QUESTIONS.length} Soal) berhasil disimpan ke Cloud & muncul di semua perangkat!`
+                : `⚠️ Room [${playerState.room}] tersimpan di perangkat ini (Cek koneksi internet/Firestore Rules jika belum muncul di perangkat lain).`
+            );
         });
 
         // ============================================================================
